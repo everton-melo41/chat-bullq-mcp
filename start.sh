@@ -7,4 +7,4 @@ if [ -z "${CHAT_BULLQ_API_KEY:-}" ]; then
   exit 1
 fi
 
-node "$SCRIPT_DIR/dist/index.js" --stdio
+exec node "$SCRIPT_DIR/dist/index.js" --stdio

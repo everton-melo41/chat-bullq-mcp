@@ -3,7 +3,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import express from 'express';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { ChatBullqClient } from './api-client.js';
 import { config } from './config.js';
 import { registerMeTools } from './tools/me.js';
@@ -34,6 +34,15 @@ async function validateApiKey(apiKey: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+function matchesApiKey(req: express.Request, apiKey: string): boolean {
+  const key = extractApiKey(req);
+  if (!key) return false;
+  return timingSafeEqual(
+    createHash('sha256').update(key).digest(),
+    createHash('sha256').update(apiKey).digest(),
+  );
 }
 
 async function requireAuth(req: express.Request, res: express.Response): Promise<string | null> {
@@ -82,19 +91,20 @@ async function runHttp(): Promise<void> {
 
   const streamableTransports = new Map<
     string,
-    { transport: StreamableHTTPServerTransport; server: McpServer; apiKey: string; authorization: string }
+    { transport: StreamableHTTPServerTransport; apiKey: string; lastSeen: number }
   >();
 
   app.all('/mcp', async (req, res) => {
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
     if (sessionId && streamableTransports.has(sessionId)) {
-      const { transport, authorization } = streamableTransports.get(sessionId)!;
-      if (req.headers.authorization !== authorization) {
+      const entry = streamableTransports.get(sessionId)!;
+      if (!matchesApiKey(req, entry.apiKey)) {
         res.status(401).json({ error: 'Authorization must match the API key used to create this session.' });
         return;
       }
-      await transport.handleRequest(req, res, req.body);
+      entry.lastSeen = Date.now();
+      await entry.transport.handleRequest(req, res, req.body);
       return;
     }
 
@@ -107,18 +117,20 @@ async function runHttp(): Promise<void> {
       });
       const server = createServer(apiKey);
 
+      let closed = false;
       transport.onclose = () => {
+        if (closed) return;
+        closed = true;
         const sid = transport.sessionId;
         if (sid) streamableTransports.delete(sid);
-        server.close().catch(() => {});
       };
 
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
 
       const sid = transport.sessionId;
-      if (sid) {
-        streamableTransports.set(sid, { transport, server, apiKey, authorization: req.headers.authorization! });
+      if (sid && !closed) {
+        streamableTransports.set(sid, { transport, apiKey, lastSeen: Date.now() });
       }
       return;
     }
@@ -135,7 +147,7 @@ async function runHttp(): Promise<void> {
 
   const sseTransports = new Map<
     string,
-    { transport: SSEServerTransport; server: McpServer; apiKey: string; authorization: string }
+    { transport: SSEServerTransport; apiKey: string; lastSeen: number }
   >();
 
   app.get('/sse', async (req, res) => {
@@ -145,13 +157,17 @@ async function runHttp(): Promise<void> {
     const transport = new SSEServerTransport('/messages', res);
     const server = createServer(apiKey);
 
+    let closed = false;
     transport.onclose = () => {
+      if (closed) return;
+      closed = true;
       sseTransports.delete(transport.sessionId);
-      server.close().catch(() => {});
     };
 
     await server.connect(transport);
-    sseTransports.set(transport.sessionId, { transport, server, apiKey, authorization: req.headers.authorization! });
+    if (!closed) {
+      sseTransports.set(transport.sessionId, { transport, apiKey, lastSeen: Date.now() });
+    }
   });
 
   app.post('/messages', async (req, res) => {
@@ -161,12 +177,27 @@ async function runHttp(): Promise<void> {
       res.status(404).json({ error: 'Session not found' });
       return;
     }
-    if (req.headers.authorization !== entry.authorization) {
+    if (!matchesApiKey(req, entry.apiKey)) {
       res.status(401).json({ error: 'Authorization must match the API key used to create this session.' });
       return;
     }
+    entry.lastSeen = Date.now();
     await entry.transport.handlePostMessage(req, res, req.body);
   });
+
+  setInterval(() => {
+    const now = Date.now();
+    for (const sessions of [streamableTransports, sseTransports]) {
+      for (const [sessionId, entry] of sessions) {
+        if (now - entry.lastSeen > config.sessionIdleMs) {
+          sessions.delete(sessionId);
+          void entry.transport.close().catch((error) => {
+            console.error('Failed to close idle session:', error);
+          });
+        }
+      }
+    }
+  }, Math.min(config.sessionIdleMs, 60_000)).unref();
 
   const port = parseInt(process.env.PORT || '3110', 10);
   app.listen(port, '0.0.0.0', () => {
