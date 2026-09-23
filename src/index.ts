@@ -82,14 +82,18 @@ async function runHttp(): Promise<void> {
 
   const streamableTransports = new Map<
     string,
-    { transport: StreamableHTTPServerTransport; server: McpServer }
+    { transport: StreamableHTTPServerTransport; server: McpServer; apiKey: string; authorization: string }
   >();
 
   app.all('/mcp', async (req, res) => {
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
     if (sessionId && streamableTransports.has(sessionId)) {
-      const { transport } = streamableTransports.get(sessionId)!;
+      const { transport, authorization } = streamableTransports.get(sessionId)!;
+      if (req.headers.authorization !== authorization) {
+        res.status(401).json({ error: 'Authorization must match the API key used to create this session.' });
+        return;
+      }
       await transport.handleRequest(req, res, req.body);
       return;
     }
@@ -114,7 +118,7 @@ async function runHttp(): Promise<void> {
 
       const sid = transport.sessionId;
       if (sid) {
-        streamableTransports.set(sid, { transport, server });
+        streamableTransports.set(sid, { transport, server, apiKey, authorization: req.headers.authorization! });
       }
       return;
     }
@@ -129,7 +133,10 @@ async function runHttp(): Promise<void> {
 
   // --- SSE transport (legacy fallback) ---
 
-  const sseTransports = new Map<string, { transport: SSEServerTransport; server: McpServer }>();
+  const sseTransports = new Map<
+    string,
+    { transport: SSEServerTransport; server: McpServer; apiKey: string; authorization: string }
+  >();
 
   app.get('/sse', async (req, res) => {
     const apiKey = await requireAuth(req, res);
@@ -144,8 +151,7 @@ async function runHttp(): Promise<void> {
     };
 
     await server.connect(transport);
-    sseTransports.set(transport.sessionId, { transport, server });
-    await transport.start();
+    sseTransports.set(transport.sessionId, { transport, server, apiKey, authorization: req.headers.authorization! });
   });
 
   app.post('/messages', async (req, res) => {
@@ -153,6 +159,10 @@ async function runHttp(): Promise<void> {
     const entry = sseTransports.get(sessionId);
     if (!entry) {
       res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+    if (req.headers.authorization !== entry.authorization) {
+      res.status(401).json({ error: 'Authorization must match the API key used to create this session.' });
       return;
     }
     await entry.transport.handlePostMessage(req, res, req.body);
